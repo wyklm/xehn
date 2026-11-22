@@ -3,9 +3,13 @@ package warp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/netip"
+	urlpkg "net/url"
 	"strconv"
 	"time"
 )
@@ -120,6 +124,8 @@ type Session struct {
 	// 单独一个字段是必要的：Psiphon 会话里两个监听同时存在，界面要显示的是
 	// 「局域网里的电脑能不能连」的那一个（可能是 0.0.0.0），而不是内部那条。
 	userLn   net.Listener
+	// hostResolveFirst：内部 SOCKS 桥连的是节点域名，先宿主解析（见 socksPath）。
+	hostResolveFirst bool
 	Endpoint string
 	ExitIP   string
 	Country  string
@@ -456,6 +462,93 @@ func (s *Session) startSocksAt(
 	return true
 }
 
+// StartInternalSocks 在这条会话上起一个**内部** SOCKS5（只绑回环）。
+//
+// 订阅出口用它当 mihomo 的 dialer-proxy：订阅节点的出站连接先到这个 SOCKS，
+// 再由本引擎的 netstack 送进 WARP —— 这就是「WARP 前置 → 订阅节点」。
+// 与 Psiphon 上游那条监听同性质（内部，不暴露给界面）。
+func (s *Session) StartInternalSocks(ctx context.Context) (string, error) {
+	if s == nil || s.tn == nil || s.tn.stack() == nil {
+		return "", errors.New("这条会话没有 netstack，不能作为订阅出口的上游")
+	}
+	// 先宿主解析节点域名（见 socksPath.hostResolveFirst 的说明）。
+	s.hostResolveFirst = true
+	if !s.startSocksAt(ctx, "127.0.0.1:0", func(string) {}, nil, true) {
+		s.hostResolveFirst = false
+		return "", errors.New("本地 SOCKS5 监听失败（端口不可用）")
+	}
+	if s.ln == nil {
+		return "", errors.New("本地 SOCKS5 未就绪")
+	}
+	return s.ln.Addr().String(), nil
+}
+
+// HTTPGet 经这条会话的 netstack 拉一个 URL。
+//
+// 订阅（GitHub raw）在国内经常直连不通，必须借 WARP 这条隧道去拉；
+// 不能复用 ipStack.client —— 那个 Transport 会把地址改写成出口验证端点。
+func (s *Session) HTTPGet(ctx context.Context, url string, max int64) ([]byte, error) {
+	if s == nil || s.tn == nil {
+		return nil, errors.New("会话未就绪")
+	}
+	st := s.tn.stack()
+	if st == nil || st.tnet == nil {
+		return nil, errors.New("这条会话没有 netstack")
+	}
+	if max <= 0 {
+		max = 8 << 20
+	}
+	// 域名先在**宿主**解析，再让隧道拨 IP。
+	//
+	// 为什么不能只靠隧道 DNS（真机 2026-11-13 21:14）：
+	//   `拉取订阅失败: dial: lookup github.com. on 1.1.1.1: no such host`
+	// 隧道里的 1.1.1.1 一旦超时/被污染，整次刷新就废了；而宿主解析至少能拿到
+	// 一个 IP（被墙的是 TCP，不是 DNS），拿到 IP 后再走 WARP 出去就能通。
+	// 解析失败就回退原样（交给隧道 DNS），不改变原有行为。
+	if u, uerr := urlpkg.Parse(url); uerr == nil {
+		host := u.Hostname()
+		port := u.Port()
+		if port == "" {
+			port = "443"
+		}
+		if ips, lerr := net.DefaultResolver.LookupHost(ctx, host); lerr == nil && len(ips) > 0 {
+			fixed := net.JoinHostPort(ips[0], port)
+			tr := &http.Transport{
+				DisableKeepAlives: true,
+				DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+					return st.tnet.DialContext(dctx, network, fixed)
+				},
+			}
+			return doGet(tr, ctx, url, max)
+		}
+	}
+	tr := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext:       st.tnet.DialContext,
+	}
+	return doGet(tr, ctx, url, max)
+}
+
+// doGet 用给定 Transport 拉一次 URL（订阅 / 出口验证共用）。
+func doGet(tr *http.Transport, ctx context.Context, url string, max int64) ([]byte, error) {
+	defer tr.CloseIdleConnections()
+	cli := &http.Client{Transport: tr, Timeout: 40 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "xehn-sub/1")
+	resp, err := cli.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("订阅返回 HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, max))
+}
+
 // socksPath 选出这条会话的本地 SOCKS 拨号路径（见 socks.go 的 socksPath）。
 func (s *Session) socksPath() socksPath {
 	// Psiphon 会话：最终出口是 psiphon 自己，必须经它的本地 SOCKS 链式出去。
@@ -473,7 +566,12 @@ func (s *Session) socksPath() socksPath {
 		// 也就是真的走这条节点；用 tn 的 netstack 就绕开了节点，出口地区全错。
 		if s.ovpn == nil {
 			if st := s.tn.stack(); st != nil {
-				return socksPath{dial: st.tnet.DialContext, inTunnel: true, tnet: st.tnet}
+				return socksPath{
+			dial:             st.tnet.DialContext,
+			inTunnel:         true,
+			tnet:             st.tnet,
+			hostResolveFirst: s.hostResolveFirst,
+		}
 			}
 		}
 	}

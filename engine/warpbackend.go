@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/xhwarp/android-engine/subout"
 	"github.com/xhwarp/android-engine/warp"
 )
 
@@ -77,6 +79,12 @@ type warpBackend struct {
 	lastGood map[string]string
 	// VPN Gate 节点缓存（OpenVPN 出口的候选池）。懒加载，落盘在 workDir。
 	vpnGate *warp.VPNGateCache
+
+	// subExit 是订阅出口的 WARP 上游（netstack 模式 + 内部 SOCKS5）。
+	// mihomo 内核本身在 subout 包里，这里只持有它的上游，关闭时一起收掉。
+	subExit *warp.Session
+	// subPorts 是订阅出口的本地端口（controller / mixed），测速与重测用。
+	subPorts *subPorts
 }
 
 // vpnGatePath 是 VPN Gate 节点缓存文件。
@@ -1074,6 +1082,208 @@ func (b *warpBackend) connectPsiphon(
 	}, nil
 }
 
+// StartSubExit 启动「订阅出口」：
+//
+//	WARP(netstack) → 内部 SOCKS5 → mihomo 内核 → 订阅节点 → 外网
+//
+// 与 OpenVPN 出口同构（那边是 WARP → openvpn 节点），只是最后一跳换成了订阅里的
+// VLESS/Trojan/HY2 等协议，交给内嵌的 mihomo 处理。
+//
+// BLOCKING：建上游 + 拉订阅十几秒，UI 必须放后台线程。
+func (b *warpBackend) StartSubExit(
+	ctx context.Context, proto string, tunFD int,
+	country, customURL, iface string, report func(string),
+) error {
+	if tunFD <= 0 {
+		return errors.New("订阅出口需要系统 tun fd（先建 VPN）")
+	}
+	if report == nil {
+		report = func(string) {}
+	}
+	b.StopSubExit()
+
+	b.mu.Lock()
+	hs := b.handshake
+	b.mu.Unlock()
+	if hs <= 0 {
+		hs = 4 * time.Second
+	}
+
+	upCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	report("订阅出口：先建 WARP 上游（netstack 模式）…")
+	under, err := warp.OpenUnderlay(upCtx, warp.OpenVPNOptions{
+		UnderlayProto:    proto,
+		HandshakeTimeout: hs,
+		VerifyTimeout:    10 * time.Second,
+		Budget:           60 * time.Second,
+		Report:           report,
+	})
+	if err != nil {
+		return err
+	}
+	fail := func(e error) error {
+		under.Close()
+		return e
+	}
+
+	socksAddr, err := under.StartInternalSocks(upCtx)
+	if err != nil {
+		return fail(fmt.Errorf("内部 SOCKS5 起不来: %w", err))
+	}
+	report("订阅出口：WARP 已就绪，本地桥 " + socksAddr)
+
+	subURL := strings.TrimSpace(customURL)
+	if subURL == "" {
+		subURL = subout.CountryURL(country)
+	}
+	report("订阅出口：拉取订阅（经 WARP）…")
+	// 重试 3 次：GitHub 经 WARP 出去偶尔会撞上 DNS/TLS 抖动，一次失败就整次连接
+	// 报废代价太大（真机 2026-11-13 21:14：`lookup github.com. on 1.1.1.1: no such host`）。
+	var buf []byte
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		buf, lastErr = under.HTTPGet(upCtx, subURL, 8<<20)
+		if lastErr == nil {
+			break
+		}
+		report(fmt.Sprintf("拉取订阅失败（第 %d/3 次）：%v，1 秒后重试…", i+1, lastErr))
+		select {
+		case <-upCtx.Done():
+		case <-time.After(time.Second):
+		}
+	}
+	if lastErr != nil {
+		return fail(fmt.Errorf("拉取订阅失败: %w", lastErr))
+	}
+	nodes, note, err := subout.ParseClash(buf)
+	if err != nil {
+		return fail(err)
+	}
+	report("订阅出口：" + note)
+
+	// 节点域名 → IP（宿主解析）：内核解析不了任何域名（见 ResolveNodeServers 的说明）。
+	var resolved, dropped, udpOnly int
+	nodes, resolved, dropped, udpOnly = subout.ResolveNodeServers(nodes)
+	if len(nodes) == 0 {
+		return fail(errors.New("没有可用节点（域名解析失败或全部是 UDP 协议）"))
+	}
+	report(fmt.Sprintf(
+		"订阅出口：可用节点 %d 个（%d 个域名转 IP，%d 个解析失败，%d 个 UDP 协议暂不支持已跳过）",
+		len(nodes), resolved, dropped, udpOnly))
+
+	// 上次的测速结果：最快在前，select 组默认就选它 —— 第二次连接不用再等测速。
+	if ranked := subout.LoadRank(country); len(ranked) > 0 {
+		nodes = subout.SortByRank(nodes, ranked)
+		report(fmt.Sprintf("订阅出口：用上次的测速缓存排序（%d 条记录）", len(ranked)))
+	}
+
+	mixedPort := freeLoopbackPort()
+	dnsPort := freeLoopbackPort()
+	apiPort := freeLoopbackPort()
+	if mixedPort == 0 || dnsPort == 0 || apiPort == 0 {
+		return fail(errors.New("分配本地端口失败"))
+	}
+	yamlText, err := subout.BuildConfig(subout.Options{
+		TUNFD:      tunFD,
+		MTU:        1280,
+		MixedPort:  mixedPort,
+		DNSPort:    dnsPort,
+		APIPort:    apiPort,
+		BridgeAddr: socksAddr,
+		Proxies:    nodes,
+		Group:      "订阅出口",
+	})
+	if err != nil {
+		return fail(err)
+	}
+	if err := subout.Start(yamlText); err != nil {
+		return fail(fmt.Errorf("内核启动失败: %w", err))
+	}
+	// 等 mixed-port 真正开始监听，否则头几个连接会被拒。
+	time.Sleep(400 * time.Millisecond)
+
+	// **端到端验证**：只有真的能出网，才允许界面显示「已连接」。
+	//
+	// 用户的反馈很明确：「显示已连接就表示可以上网」。之前是先置已连接、再让内核
+	// 自己慢慢测节点，于是出现「已连接 + 出口 IP 获取中 + 上下行 0」。
+	// 这里从 Go 侧直接拨 1.1.1.1:80：这个 socket 没被 protect，会被 VpnService
+	// 抓进 tun → 内核按 MATCH 走订阅节点 → 真出网。走通才说明整条链可用。
+	report("订阅出口：验证能否出网（DNS + TCP，最多等 20 秒）…")
+	// 用**域名**而不是 IP：这样一次验证覆盖两段链 ——
+	//   DNS：应用查询 → tun → hijack → 内核 DNS → tcp://1.1.1.1 → 节点 → 境外解析
+	//   TCP：应用连接 → tun → MATCH → 节点 → 目标站
+	// 只测 IP 会漏掉 DNS（那正是「能 ping 通、网页打不开」的原因）。
+	ok := false
+	var dialErr error
+	for i := 0; i < 8; i++ {
+		c, derr := net.DialTimeout("tcp", "www.gstatic.com:80", 4*time.Second)
+		if derr == nil {
+			_ = c.Close()
+			ok = true
+			break
+		}
+		dialErr = derr
+		if upCtx.Err() != nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !ok {
+		return fail(fmt.Errorf(
+			"节点已加载但无法出网（DNS 或 TCP 不通：%v），已取消连接", dialErr))
+	}
+	report("订阅出口：出网验证通过（DNS + TCP）")
+
+	// 出网验证已通过 → 记下端口，供测速与定时重测使用。
+	b.mu.Lock()
+	b.subExit = under
+	b.subPorts = &subPorts{api: apiPort, mixed: mixedPort, group: "订阅出口"}
+	b.mu.Unlock()
+
+	// 后台按速度选最快：不阻塞「已连接」，但下一次连接会用上这次的结果。
+	go b.rankSubExit(country, nodes)
+	// 定时重测：订阅每小时刷新、节点掉得很快，只在连接那一刻测一次的话
+	// 半小时后可能已经跑在死节点上。
+	go b.keepSubExitFresh(country, nodes, 10*time.Minute)
+	report(fmt.Sprintf("订阅出口已启动（%d 个节点，经 WARP 前置，mixed-port %d）", len(nodes), mixedPort))
+	return nil
+}
+
+// freeLoopbackPort 向内核要一个空闲的本地端口（拿到后立刻释放，交给 mihomo 用）。
+func freeLoopbackPort() int {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0
+	}
+	defer l.Close()
+	if a, ok := l.Addr().(*net.TCPAddr); ok {
+		return a.Port
+	}
+	return 0
+}
+
+// StopSubExit 关掉订阅出口（内核 + 上游 + 定时重测）。
+func (b *warpBackend) StopSubExit() {
+	subout.Stop()
+	b.mu.Lock()
+	u := b.subExit
+	b.subExit = nil
+	b.subPorts = nil
+	b.mu.Unlock()
+	// 定时重测的循环：关掉它，避免换出口后还在往旧端口上切节点。
+	subRankMu.Lock()
+	if subRankStop != nil {
+		close(subRankStop)
+		subRankStop = nil
+	}
+	subRankMu.Unlock()
+	if u != nil {
+		u.Close()
+	}
+}
+
 // Connect 建隧道。失败时**必须**把系统 VPN 一起收掉 —— 见下面 defer 里的说明。
 func (b *warpBackend) Connect(ctx context.Context, req Request, report func(string)) (result Result, err error) {
 	// 连接失败时收掉还挂在系统 VPN 上的 tun fd。
@@ -1102,9 +1312,16 @@ func (b *warpBackend) Connect(ctx context.Context, req Request, report func(stri
 		// 只有「基础 WARP 隧道」自己的失败才可能与账号有关：节点出口（OpenVPN /
 		// Psiphon）连不上是节点或网络的事，算到账号头上就会「每次启动都在重新注册」
 		// 一台新设备（真机日志：4 次固定节点失败之后账号被删掉）。
-		accountRelated := !errors.Is(err, errTunEstablish) &&
+		// 反例（2026-11-11 20:02 真机日志，都真实发生过）：
+		//   · wwarp：外层已上线（`外层已就绪`），只是**内层** 20 个端点没握上
+		//     —— 账号是好的，删掉只会让下次又要重新注册；
+		//   · 用户点「断开」触发的 context.Canceled —— 更不该算账号失败。
+		accountRelated := err != nil &&
+			!errors.Is(err, errTunEstablish) &&
+			!errors.Is(err, context.Canceled) &&
 			!strings.Contains(err.Error(), "OpenVPN 节点") &&
-			!strings.Contains(err.Error(), "Psiphon")
+			!strings.Contains(err.Error(), "Psiphon") &&
+			!strings.Contains(err.Error(), "可用端点")
 		b.mu.Lock()
 		if accountRelated {
 			b.accountFailStreak++
